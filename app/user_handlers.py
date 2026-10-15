@@ -12,7 +12,6 @@ from app.config import Settings
 from app.database import Database
 from app.domain import toggle_selection
 from app.keyboards import (
-    finish_conversation,
     form_options,
     user_home,
 )
@@ -45,6 +44,7 @@ async def _show_draft(message: Message | CallbackQuery, database: Database, sett
     else:
         step = draft["step"]
         data = draft["data"]
+        data.setdefault("chat_message_ids", [])
         fields = data.get("have_fields", data.get("have", [])) if step == "have" else data.get(
             "need_fields", data.get("need", [])
         )
@@ -58,14 +58,33 @@ async def _show_draft(message: Message | CallbackQuery, database: Database, sett
         keyboard = None
         if step in {"have", "need"}:
             keyboard = form_options(step, tuple(settings.info_options), fields)
+    saved_draft = bool(draft)
+    sent_message = None
     if isinstance(message, CallbackQuery):
         await message.answer()
+        if saved_draft:
+            message_ids = draft["data"].setdefault("chat_message_ids", [])
+            if message.message.message_id not in message_ids:
+                message_ids.append(message.message.message_id)
+            await database.save_draft(
+                await database.register_user(message.from_user.id), draft["step"], draft["data"]
+            )
         try:
             await message.message.edit_text(text, reply_markup=keyboard)
         except TelegramBadRequest:
-            await message.message.answer(text, reply_markup=keyboard)
+            sent_message = await message.message.answer(
+                text, reply_markup=keyboard, protect_content=True
+            )
     else:
-        await message.answer(text, reply_markup=keyboard)
+        sent_message = await message.answer(text, reply_markup=keyboard, protect_content=True)
+    if saved_draft and sent_message:
+        message_ids = draft["data"].setdefault("chat_message_ids", [])
+        sent_id = getattr(sent_message, "message_id", None)
+        if isinstance(sent_id, int) and sent_id not in message_ids:
+            message_ids.append(sent_id)
+            await database.save_draft(
+                await database.register_user(message.from_user.id), draft["step"], draft["data"]
+            )
 
 
 async def _register_user(database: Database, user) -> int:
@@ -109,7 +128,7 @@ async def _show_home(message: Message | CallbackQuery, settings: Settings) -> No
         except TelegramBadRequest:
             await message.message.answer(welcome, reply_markup=user_home())
     else:
-        await message.answer(welcome, reply_markup=user_home())
+        await message.answer(welcome, reply_markup=user_home(), protect_content=True)
 
 
 @router.message(CommandStart(), F.chat.type == "private")
@@ -203,7 +222,7 @@ async def _submit_ready_draft(
         sent = await bot.send_message(
             settings.admin_telegram_id,
             _format_new_case(case),
-            reply_markup=finish_conversation(case["id"]),
+            protect_content=True,
         )
         await database.save_request_reply_target(case["id"], sent.chat.id, sent.message_id)
     except TelegramAPIError:
@@ -229,17 +248,21 @@ async def user_messages(message: Message, bot: Bot, database: Database, settings
     draft = await database.get_draft(message.from_user.id)
     if draft:
         user_id = await _register_user(database, message.from_user)
+        message_ids = draft["data"].setdefault("chat_message_ids", [])
+        if message.message_id not in message_ids:
+            message_ids.append(message.message_id)
+            await database.save_draft(user_id, draft["step"], draft["data"])
         if draft["step"] != "have_value" or message.text is None:
-            await message.answer("مقدار را به‌صورت متن بفرست.")
+            await message.answer("مقدار را به‌صورت متن بفرست.", protect_content=True)
             return
         answer = message.text.strip()
         fields = draft["data"].get("have_fields", [])
         index = draft["data"].get("field_index", 0)
         if not answer:
-            await message.answer("مقدار را خالی نگذار.")
+            await message.answer("مقدار را خالی نگذار.", protect_content=True)
             return
         if len(answer) > 500 or not fields or not isinstance(index, int) or not 0 <= index < len(fields):
-            await message.answer("مقدار معتبر نیست؛ دوباره بفرست.")
+            await message.answer("مقدار معتبر نیست؛ دوباره بفرست.", protect_content=True)
             return
         values = draft["data"].setdefault("have_values", {})
         values[fields[index]] = answer
@@ -254,7 +277,10 @@ async def user_messages(message: Message, bot: Bot, database: Database, settings
 
     session = await database.get_session(message.from_user.id)
     if session and session.get("mode") == "closed":
-        await message.answer("این گفت‌وگو تموم شده. برای ثبت درخواست جدید، /start رو بزن.")
+        await message.answer(
+            "این گفت‌وگو تموم شده. برای ثبت درخواست جدید، /start رو بزن.",
+            protect_content=True,
+        )
         return
     if not session or session.get("mode") != "conversation" or session.get("case_id") is None:
         return
@@ -262,7 +288,10 @@ async def user_messages(message: Message, bot: Bot, database: Database, settings
     if not case:
         return
     if case.get("conversation_status") != "OPEN":
-        await message.answer("این گفت‌وگو تموم شده. برای ثبت درخواست جدید، /start رو بزن.")
+        await message.answer(
+            "این گفت‌وگو تموم شده. برای ثبت درخواست جدید، /start رو بزن.",
+            protect_content=True,
+        )
         return
     media_type, file_id, text, error = await message_media(message, bot, settings.max_upload_bytes)
     if error:
@@ -274,11 +303,11 @@ async def user_messages(message: Message, bot: Bot, database: Database, settings
     if not inserted:
         return
     try:
-        copied = await bot.copy_message(
+        copied = await bot.forward_message(
             chat_id=settings.admin_telegram_id,
             from_chat_id=message.chat.id,
             message_id=message.message_id,
-            reply_markup=finish_conversation(case["id"]),
+            protect_content=True,
         )
     except Exception:
         await database.update_message_delivery(message.chat.id, message.message_id, "FAILED")

@@ -118,6 +118,12 @@ class Database:
                     case_id INTEGER NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
                     PRIMARY KEY(chat_id, message_id)
                 );
+                CREATE TABLE IF NOT EXISTS user_chat_messages (
+                    case_id INTEGER NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+                    chat_id INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    PRIMARY KEY(case_id, chat_id, message_id)
+                );
                 CREATE TABLE IF NOT EXISTS payments (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     case_id INTEGER NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
@@ -180,20 +186,27 @@ class Database:
             for column in ("first_name", "last_name", "username"):
                 if column not in user_columns:
                     await db.execute(f"ALTER TABLE users ADD COLUMN {column} TEXT")
+            terminal_statuses = (
+                CaseStatus.REJECTED.value,
+                CaseStatus.COMPLETED.value,
+                CaseStatus.CANCELLED.value,
+                CaseStatus.EXPIRED.value,
+            )
             await db.execute(
-                "UPDATE cases SET conversation_status='CLOSED' WHERE status IN (?, ?, ?, ?) "
-                "AND conversation_status='PENDING'",
-                (
-                    CaseStatus.REJECTED.value,
-                    CaseStatus.COMPLETED.value,
-                    CaseStatus.CANCELLED.value,
-                    CaseStatus.EXPIRED.value,
-                ),
+                f"UPDATE cases SET conversation_status='CLOSED' WHERE status IN "
+                f"({','.join('?' for _ in terminal_statuses)}) AND conversation_status!='CLOSED'",
+                terminal_statuses,
+            )
+            await db.execute(
+                "UPDATE cases SET conversation_status='PENDING' "
+                "WHERE conversation_status='OPEN' AND NOT EXISTS ("
+                "SELECT 1 FROM sessions s JOIN users u ON u.telegram_id=s.telegram_id "
+                "WHERE s.case_id=cases.id AND s.mode='conversation' AND u.id=cases.user_id)"
             )
             await db.execute(
                 "UPDATE cases SET conversation_status='OPEN' WHERE conversation_status='PENDING' "
                 "AND EXISTS (SELECT 1 FROM sessions s JOIN users u ON u.telegram_id=s.telegram_id "
-                "WHERE s.mode='conversation' AND u.id=cases.user_id)"
+                "WHERE s.case_id=cases.id AND s.mode='conversation' AND u.id=cases.user_id)"
             )
             cursor = await db.execute("PRAGMA table_info(sessions)")
             session_columns = {row["name"] for row in await cursor.fetchall()}
@@ -354,6 +367,13 @@ class Database:
             data["requested_fields"] = fields
             data["requested_values"] = values
             case_id = await self._insert_case(db, user_id, data, now)
+            for message_id in set(data.get("chat_message_ids", [])):
+                if isinstance(message_id, int) and message_id > 0:
+                    await db.execute(
+                        "INSERT OR IGNORE INTO user_chat_messages(case_id, chat_id, message_id) "
+                        "VALUES (?, ?, ?)",
+                        (case_id, telegram_id, message_id),
+                    )
             await db.execute("DELETE FROM drafts WHERE user_id=?", (user_id,))
             await db.commit()
         case = await self.get_case(case_id)
@@ -780,6 +800,26 @@ class Database:
                 (case_id, limit),
             )
             return [cast(MessageRecord, dict(row)) for row in reversed(await cursor.fetchall())]
+    async def conversation_message_routes(self, case_id: int) -> list[dict[str, Any]]:
+        async with self.connect() as db:
+            cursor = await db.execute(
+                "SELECT sender_kind, source_chat_id, source_message_id, destination_message_id "
+                "FROM messages WHERE case_id=? ORDER BY created_at, id",
+                (case_id,),
+            )
+            return [dict(row) for row in await cursor.fetchall()]
+
+    async def user_chat_message_ids(self, case_id: int, telegram_id: int) -> list[int]:
+        async with self.connect() as db:
+            cursor = await db.execute(
+                "SELECT message_id FROM user_chat_messages WHERE case_id=? AND chat_id=? "
+                "UNION SELECT source_message_id FROM messages WHERE case_id=? AND sender_kind='user' "
+                "AND source_chat_id=? "
+                "UNION SELECT destination_message_id FROM messages WHERE case_id=? "
+                "AND sender_kind='admin' AND destination_message_id IS NOT NULL",
+                (case_id, telegram_id, case_id, telegram_id, case_id),
+            )
+            return [int(row["message_id"]) for row in await cursor.fetchall()]
 
     async def record_receipt(
         self,
@@ -979,6 +1019,7 @@ class Database:
                         await db.rollback()
                         continue
                     await db.execute("DELETE FROM messages WHERE case_id=?", (candidate["id"],))
+                    await db.execute("DELETE FROM user_chat_messages WHERE case_id=?", (candidate["id"],))
                     await db.execute("DELETE FROM payments WHERE case_id=?", (candidate["id"],))
                     await db.execute("DELETE FROM consent_records WHERE case_id=?", (candidate["id"],))
                     await db.execute(

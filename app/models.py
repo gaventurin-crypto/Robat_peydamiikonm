@@ -8,6 +8,7 @@ class DraftData(TypedDict):
     have_values: NotRequired[dict[str, str]]
     requested_fields: NotRequired[list[str]]
     requested_values: NotRequired[dict[str, str]]
+    chat_message_ids: NotRequired[list[int]]
     field_index: NotRequired[int]
 
 

@@ -4,7 +4,7 @@ import logging
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramAPIError
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, Message
 
 from app.config import Settings
 from app.database import Database
@@ -21,7 +21,7 @@ def _is_admin(user_id: int, chat_type: str, settings: Settings) -> bool:
 
 @router.callback_query(F.data.startswith("a:end:"), F.message.chat.type == "private")
 async def end_conversation(
-    callback: CallbackQuery, database: Database, settings: Settings
+    callback: CallbackQuery, bot: Bot, database: Database, settings: Settings
 ) -> None:
     if not _is_admin(callback.from_user.id, callback.message.chat.type, settings):
         await callback.answer()
@@ -31,14 +31,22 @@ async def end_conversation(
     except (ValueError, AttributeError):
         await callback.answer()
         return
-    if not await database.end_conversation(case_id, settings.admin_telegram_id):
+    case = await database.get_case(case_id)
+    if not case or not await database.end_conversation(case_id, settings.admin_telegram_id):
         await callback.answer("گفتگو قبلاً پایان یافته است.")
         return
+    await callback.answer("گفتگو پایان یافت.")
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
     except TelegramAPIError:
         logger.info("could not remove end button for case %s", case_id)
-    await callback.answer("گفتگو پایان یافت.")
+    if case.get("telegram_id"):
+        message_ids = await database.user_chat_message_ids(case_id, case["telegram_id"])
+        for message_id in message_ids:
+            try:
+                await bot.delete_message(case["telegram_id"], message_id)
+            except TelegramAPIError:
+                logger.info("conversation message could not be deleted for case %s", case_id)
 
 
 @router.message(F.chat.type == "private")
@@ -63,7 +71,7 @@ async def reply_to_request(
     starting = case["conversation_status"] == "PENDING"
     if starting:
         if not await database.start_conversation(case["id"], settings.admin_telegram_id):
-            await message.answer("گفتگوی این کاربر در دسترس نیست.")
+            await message.answer("گفتگوی دیگری برای این کاربر باز است؛ ابتدا آن را با «تمام شد» ببند.")
             return
     elif case["conversation_status"] != "OPEN":
         await message.answer("این گفتگو پایان یافته است.")
@@ -95,6 +103,7 @@ async def reply_to_request(
             chat_id=case["telegram_id"],
             from_chat_id=message.chat.id,
             message_id=message.message_id,
+            protect_content=True,
         )
     except Exception:
         await database.update_message_delivery(message.chat.id, message.message_id, "FAILED")
@@ -112,7 +121,12 @@ async def reply_to_request(
         logger.error("manager message delivered but conversation activation failed for case %s", case["id"])
         return
     await database.set_session(case["telegram_id"], case["id"], "conversation")
-    try:
-        await message.edit_reply_markup(reply_markup=finish_conversation(case["id"]))
-    except TelegramAPIError:
-        logger.warning("could not attach finish button to manager reply for case %s", case["id"])
+    if starting:
+        try:
+            await bot.edit_message_reply_markup(
+                chat_id=message.chat.id,
+                message_id=reply_to.message_id,
+                reply_markup=finish_conversation(case["id"]),
+            )
+        except TelegramAPIError:
+            logger.warning("could not attach finish button to request for case %s", case["id"])

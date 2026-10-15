@@ -23,10 +23,21 @@ class FakeBot:
     def __init__(self):
         self.copies = []
         self.sent = []
+        self.deleted = []
 
     async def copy_message(self, **kwargs):
         self.copies.append(kwargs)
         return SimpleNamespace(message_id=500 + len(self.copies))
+
+    async def forward_message(self, **kwargs):
+        self.copies.append(kwargs)
+        return SimpleNamespace(message_id=500 + len(self.copies))
+
+    async def edit_message_reply_markup(self, **kwargs):
+        self.sent.append(((), kwargs))
+
+    async def delete_message(self, chat_id, message_id):
+        self.deleted.append((chat_id, message_id))
 
     async def send_message(self, *args, **kwargs):
         self.sent.append((args, kwargs))
@@ -208,7 +219,7 @@ async def test_user_delivery_failure_is_recorded_for_retry(database, settings):
     async def fail_copy(**kwargs):
         raise RuntimeError("synthetic Telegram API failure")
 
-    bot.copy_message = fail_copy
+    bot.forward_message = fail_copy
     message = FakeMessage(112, 16, text="پیام آزمایشی")
 
     await user_messages(message, bot, database, settings)
@@ -584,8 +595,16 @@ async def test_active_conversation_replies_route_and_stop_with_the_same_case(dat
     )
     assert (await database.get_case(case["id"]))["conversation_status"] == "OPEN"
     assert (await database.get_session(1200))["mode"] == "conversation"
+    finish_markup = bot.sent[-1][1]["reply_markup"]
+    finish_callbacks = [
+        button.callback_data
+        for row in finish_markup.inline_keyboard
+        for button in row
+    ]
+    assert finish_callbacks == [f"a:end:{case['id']}"]
 
     await user_messages(FakeMessage(1200, 42, text="پاسخ کاربر"), bot, database, settings)
+    assert "reply_markup" not in bot.copies[-1]
     forwarded_user_message_id = 500 + len(bot.copies)
     await reply_to_request(
         FakeMessage(
@@ -603,12 +622,16 @@ async def test_active_conversation_replies_route_and_stop_with_the_same_case(dat
     assert bot.copies[0]["chat_id"] == 1200
     assert bot.copies[1]["chat_id"] == settings.admin_telegram_id
     assert bot.copies[2]["chat_id"] == 1200
+    assert all(copy["protect_content"] is True for copy in bot.copies)
     reopened = Database(database.path)
     assert len(await reopened.list_messages(case["id"])) == 3
 
-    await end_conversation(
-        FakeCallback(settings.admin_telegram_id, f"a:end:{case['id']}"), database, settings
-    )
+    finish_callback = FakeCallback(settings.admin_telegram_id, f"a:end:{case['id']}")
+    await end_conversation(finish_callback, bot, database, settings)
+    assert finish_callback.message.markups[-1] is None
+    assert (1200, 42) in bot.deleted
+    assert (1200, 503) in bot.deleted
+    assert len(await database.list_messages(case["id"])) == 3
     assert (await database.get_case(case["id"]))["conversation_status"] == "CLOSED"
     assert (await database.get_session(1200))["mode"] == "closed"
     copies_before_closed_message = len(bot.copies)
@@ -662,3 +685,31 @@ async def test_manager_reply_keeps_two_users_separate(database, settings):
     assert [copy["chat_id"] for copy in bot.copies] == [1501, 1502]
     assert len(await database.list_messages(first_case["id"])) == 1
     assert len(await database.list_messages(second_case["id"])) == 1
+
+
+@pytest.mark.asyncio
+async def test_same_user_new_request_can_start_after_previous_chat_is_closed(database, settings):
+    old_case = await database.create_case(1601, request_data())
+    new_case = await database.create_case(1601, request_data())
+    assert await database.start_conversation(old_case["id"], settings.admin_telegram_id)
+    assert await database.activate_conversation(old_case["id"], settings.admin_telegram_id)
+    await database.set_session(1601, old_case["id"], "conversation")
+    await database.save_request_reply_target(
+        new_case["id"], settings.admin_telegram_id, 160
+    )
+    bot = FakeBot()
+    reply = FakeMessage(
+        settings.admin_telegram_id,
+        61,
+        text="پاسخ درخواست جدید",
+        reply_to_message=SimpleNamespace(message_id=160),
+    )
+
+    await reply_to_request(reply, bot, database, settings)
+    assert bot.copies == []
+    assert "گفتگوی دیگری" in reply.answers[-1]
+
+    assert await database.end_conversation(old_case["id"], settings.admin_telegram_id)
+    await reply_to_request(reply, bot, database, settings)
+    assert [copy["chat_id"] for copy in bot.copies] == [1601]
+    assert (await database.get_case(new_case["id"]))["conversation_status"] == "OPEN"

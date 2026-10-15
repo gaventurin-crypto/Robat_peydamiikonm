@@ -90,6 +90,7 @@ async def test_submit_draft_allows_empty_sections_and_unvalued_search_types(data
             "need_fields": ["شماره تماس", "آدرس"],
             "requested_fields": ["شماره تماس", "آدرس"],
             "requested_values": {},
+            "chat_message_ids": [81, 82, 81],
         },
     )
 
@@ -99,6 +100,7 @@ async def test_submit_draft_allows_empty_sections_and_unvalued_search_types(data
     assert json.loads(case["have_options"]) == []
     assert json.loads(case["have_values"]) == {}
     assert json.loads(case["need_options"]) == ["شماره تماس", "آدرس"]
+    assert await database.user_chat_message_ids(case["id"], 206) == [81, 82]
 
 
 @pytest.mark.asyncio
@@ -128,6 +130,22 @@ async def test_conversation_lifecycle_is_case_scoped_and_persistent(database):
     assert (await database.get_session(900))["mode"] == "closed"
     assert (await database.audit_history(case["id"]))[-1]["event_type"] == "CONVERSATION_CLOSED"
     assert not await database.start_conversation(case["id"], 900)
+
+
+@pytest.mark.asyncio
+async def test_initialize_does_not_mark_new_case_open_from_another_case_session(database):
+    active_case = await database.create_case(207, sample_data())
+    pending_case = await database.create_case(207, sample_data())
+    assert await database.start_conversation(active_case["id"], 900)
+    assert await database.activate_conversation(active_case["id"], 900)
+    await database.set_session(207, active_case["id"], "conversation")
+
+    await database.initialize()
+
+    assert (await database.get_case(active_case["id"]))["conversation_status"] == "OPEN"
+    assert (await database.get_case(pending_case["id"]))["conversation_status"] == "PENDING"
+    assert await database.end_conversation(active_case["id"], 900)
+    assert await database.start_conversation(pending_case["id"], 900)
 
 
 @pytest.mark.asyncio
