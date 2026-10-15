@@ -562,6 +562,32 @@ class Database:
             cursor = await db.execute(query, parameters)
             return int((await cursor.fetchone())["count"])
 
+    async def list_admin_chats(self, limit: int = 20, offset: int = 0) -> list[CaseSummary]:
+        async with self.connect() as db:
+            cursor = await db.execute(
+                "SELECT c.id, c.case_number, c.status, c.created_at, c.conversation_status, "
+                "u.telegram_id, u.first_name, u.last_name, u.username, "
+                "(SELECT MAX(m.created_at) FROM messages m WHERE m.case_id=c.id) AS last_message_at, "
+                "(SELECT COALESCE(m.text, '[' || m.media_type || ']') FROM messages m "
+                "WHERE m.case_id=c.id ORDER BY m.created_at DESC, m.id DESC LIMIT 1) AS last_message "
+                "FROM cases c LEFT JOIN users u ON u.id=c.user_id "
+                "WHERE c.conversation_status IN ('PENDING', 'STARTING', 'OPEN') "
+                "AND c.status != ? "
+                "ORDER BY COALESCE((SELECT MAX(m.created_at) FROM messages m WHERE m.case_id=c.id), "
+                "c.created_at) DESC, c.id DESC LIMIT ? OFFSET ?",
+                (CaseStatus.EXPIRED.value, limit, offset),
+            )
+            return [cast(CaseSummary, dict(row)) for row in await cursor.fetchall()]
+
+    async def count_admin_chats(self) -> int:
+        async with self.connect() as db:
+            cursor = await db.execute(
+                "SELECT COUNT(*) AS count FROM cases WHERE conversation_status IN "
+                "('PENDING', 'STARTING', 'OPEN') AND status != ?",
+                (CaseStatus.EXPIRED.value,),
+            )
+            return int((await cursor.fetchone())["count"])
+
     async def search_cases(self, query_text: str, limit: int = 10) -> list[CaseSummary]:
         normalized = normalize_case_id(query_text)
         if normalized.isdigit():

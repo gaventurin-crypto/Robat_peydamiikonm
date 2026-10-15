@@ -6,7 +6,12 @@ import pytest
 import pytest_asyncio
 
 from app.admin_handlers import admin_callbacks, admin_messages
-from app.conversation_handlers import end_conversation, reply_to_request
+from app.conversation_handlers import (
+    end_conversation,
+    manager_navigation,
+    manager_start,
+    reply_to_request,
+)
 from app.database import Database
 from app.domain import CaseStatus, INFO_OPTIONS
 from app.user_handlers import start_user, user_callbacks, user_messages
@@ -35,6 +40,9 @@ class FakeBot:
 
     async def edit_message_reply_markup(self, **kwargs):
         self.sent.append(((), kwargs))
+
+    async def edit_message_text(self, text, **kwargs):
+        self.sent.append(((text,), kwargs))
 
     async def delete_message(self, chat_id, message_id):
         self.deleted.append((chat_id, message_id))
@@ -142,7 +150,7 @@ async def test_start_registers_user_and_shows_welcome(database, settings):
     await start_user(message, database, settings)
 
     assert await database.register_user(90) > 0
-    assert message.answers == ["سلام! برای ثبت درخواست، دکمهٔ زیر را بزن."]
+    assert message.answers == ["سلام! 👋\n\nبرای ثبت درخواست از دکمهٔ زیر شروع کن."]
     callbacks = [
         button.callback_data
         for row in message.markups[-1].inline_keyboard
@@ -180,7 +188,7 @@ async def test_user_messages_are_bound_to_selected_case(
 
     await user_messages(message, bot, database, settings)
 
-    assert bot.copies[0]["chat_id"] == settings.admin_telegram_id
+    assert bot.copies == []
     stored = await database.list_messages(case["id"])
     assert len(stored) == 1
     assert stored[0]["media_type"] == media_type
@@ -189,7 +197,7 @@ async def test_user_messages_are_bound_to_selected_case(
 
 
 @pytest.mark.asyncio
-async def test_user_document_is_validated_and_forwarded(database, settings):
+async def test_user_document_is_validated_and_saved_for_selected_chat(database, settings):
     case = await database.create_case(111, request_data())
     await open_conversation(database, case, 111)
     message = FakeMessage(
@@ -206,26 +214,32 @@ async def test_user_document_is_validated_and_forwarded(database, settings):
 
     await user_messages(message, bot, database, settings)
 
-    assert bot.copies[0]["chat_id"] == settings.admin_telegram_id
+    assert bot.copies == []
     assert (await database.list_messages(case["id"]))[0]["media_type"] == "document"
 
 
 @pytest.mark.asyncio
-async def test_user_delivery_failure_is_recorded_for_retry(database, settings):
+async def test_user_message_is_saved_in_inbox_without_forwarding(database, settings):
     case = await database.create_case(112, request_data())
     await open_conversation(database, case, 112)
     bot = FakeBot()
 
-    async def fail_copy(**kwargs):
-        raise RuntimeError("synthetic Telegram API failure")
-
-    bot.forward_message = fail_copy
     message = FakeMessage(112, 16, text="پیام آزمایشی")
 
     await user_messages(message, bot, database, settings)
 
-    assert (await database.list_messages(case["id"]))[0]["delivery_state"] == "FAILED"
-    assert message.answers == []
+    stored = await database.list_messages(case["id"])
+    assert stored[0]["delivery_state"] == "SENT"
+    assert stored[0]["text"] == "پیام آزمایشی"
+    assert bot.copies == []
+    assert "پیام جدید از" in bot.sent[0][0][1]
+    assert "پیام آزمایشی" in bot.sent[0][0][1]
+    notice_buttons = [
+        button.callback_data
+        for row in bot.sent[0][1]["reply_markup"].inline_keyboard
+        for button in row
+    ]
+    assert notice_buttons == [f"m:open:{case['id']}:0"]
 
 
 @pytest.mark.asyncio
@@ -604,15 +618,15 @@ async def test_active_conversation_replies_route_and_stop_with_the_same_case(dat
     assert finish_callbacks == [f"a:end:{case['id']}"]
 
     await user_messages(FakeMessage(1200, 42, text="پاسخ کاربر"), bot, database, settings)
-    assert "reply_markup" not in bot.copies[-1]
-    forwarded_user_message_id = 500 + len(bot.copies)
+    assert len(bot.copies) == 1
+    await manager_navigation(
+        FakeCallback(settings.admin_telegram_id, f"m:open:{case['id']}:0"), database, settings
+    )
+    await manager_navigation(
+        FakeCallback(settings.admin_telegram_id, f"m:reply:{case['id']}:0"), database, settings
+    )
     await reply_to_request(
-        FakeMessage(
-            settings.admin_telegram_id,
-            43,
-            text="پاسخ مدیر با Reply",
-            reply_to_message=SimpleNamespace(message_id=forwarded_user_message_id),
-        ),
+        FakeMessage(settings.admin_telegram_id, 43, text="پاسخ مدیر از چت جدا"),
         bot,
         database,
         settings,
@@ -620,17 +634,18 @@ async def test_active_conversation_replies_route_and_stop_with_the_same_case(dat
 
     assert len(await database.list_messages(case["id"])) == 3
     assert bot.copies[0]["chat_id"] == 1200
-    assert bot.copies[1]["chat_id"] == settings.admin_telegram_id
-    assert bot.copies[2]["chat_id"] == 1200
+    assert bot.copies[1]["chat_id"] == 1200
     assert all(copy["protect_content"] is True for copy in bot.copies)
     reopened = Database(database.path)
     assert len(await reopened.list_messages(case["id"])) == 3
 
     finish_callback = FakeCallback(settings.admin_telegram_id, f"a:end:{case['id']}")
     await end_conversation(finish_callback, bot, database, settings)
-    assert finish_callback.message.markups[-1] is None
+    assert finish_callback.message.edits[-1] == "💬 گفتگوها · 0"
+    assert finish_callback.message.markups[-1].inline_keyboard == []
     assert (1200, 42) in bot.deleted
-    assert (1200, 503) in bot.deleted
+    assert (1200, 501) in bot.deleted
+    assert (1200, 502) in bot.deleted
     assert len(await database.list_messages(case["id"])) == 3
     assert (await database.get_case(case["id"]))["conversation_status"] == "CLOSED"
     assert (await database.get_session(1200))["mode"] == "closed"
@@ -688,6 +703,33 @@ async def test_manager_reply_keeps_two_users_separate(database, settings):
 
 
 @pytest.mark.asyncio
+async def test_simultaneous_user_messages_create_separate_manager_alerts(database, settings):
+    first_case = await database.create_case(1551, request_data())
+    second_case = await database.create_case(1552, request_data())
+    await open_conversation(database, first_case, 1551)
+    await open_conversation(database, second_case, 1552)
+    bot = FakeBot()
+
+    await user_messages(FakeMessage(1551, 1, text="پیام کاربر اول"), bot, database, settings)
+    await user_messages(FakeMessage(1552, 1, text="پیام کاربر دوم"), bot, database, settings)
+
+    notices = [sent[0][1] for sent in bot.sent]
+    assert "شناسه: 1551" in notices[0]
+    assert "پیام کاربر اول" in notices[0]
+    assert "شناسه: 1552" in notices[1]
+    assert "پیام کاربر دوم" in notices[1]
+    for notice, case in zip(bot.sent, (first_case, second_case), strict=True):
+        callbacks = [
+            button.callback_data
+            for row in notice[1]["reply_markup"].inline_keyboard
+            for button in row
+        ]
+        assert callbacks == [f"m:open:{case['id']}:0"]
+    assert (await database.list_messages(first_case["id"]))[0]["text"] == "پیام کاربر اول"
+    assert (await database.list_messages(second_case["id"]))[0]["text"] == "پیام کاربر دوم"
+
+
+@pytest.mark.asyncio
 async def test_same_user_new_request_can_start_after_previous_chat_is_closed(database, settings):
     old_case = await database.create_case(1601, request_data())
     new_case = await database.create_case(1601, request_data())
@@ -713,3 +755,63 @@ async def test_same_user_new_request_can_start_after_previous_chat_is_closed(dat
     await reply_to_request(reply, bot, database, settings)
     assert [copy["chat_id"] for copy in bot.copies] == [1601]
     assert (await database.get_case(new_case["id"]))["conversation_status"] == "OPEN"
+
+
+@pytest.mark.asyncio
+async def test_manager_inbox_lists_each_user_as_a_separate_chat(database, settings):
+    first_case = await database.create_case(1701, request_data())
+    second_case = await database.create_case(1702, request_data())
+    await database.add_message(first_case["id"], "user", "text", "پیام از نفر اول", None, 1701, 1)
+    await database.add_message(second_case["id"], "user", "text", "پیام از نفر دوم", None, 1702, 1)
+    manager_message = FakeMessage(settings.admin_telegram_id, 77, text="/start")
+
+    await manager_start(manager_message, database, settings)
+
+    assert "گفتگوها · 2" in manager_message.answers[-1]
+    buttons = [
+        button
+        for row in manager_message.markups[-1].inline_keyboard
+        for button in row
+    ]
+    assert {button.callback_data for button in buttons} == {
+        f"m:open:{first_case['id']}:0",
+        f"m:open:{second_case['id']}:0",
+    }
+
+
+@pytest.mark.asyncio
+async def test_manager_opens_one_chat_and_replies_only_to_selected_case(database, settings):
+    first_case = await database.create_case(1801, request_data())
+    second_case = await database.create_case(1802, request_data())
+    await database.add_message(first_case["id"], "user", "text", "پیام اول", None, 1801, 1)
+    await database.add_message(second_case["id"], "user", "text", "پیام دوم", None, 1802, 1)
+    bot = FakeBot()
+
+    open_callback = FakeCallback(settings.admin_telegram_id, f"m:open:{first_case['id']}:0")
+    await manager_navigation(open_callback, database, settings)
+    transcript = open_callback.answers[-1][0]
+    assert "پیام اول" in transcript
+    assert "پیام دوم" not in transcript
+    buttons = [
+        button.callback_data
+        for row in open_callback.answers[-1][1]["reply_markup"].inline_keyboard
+        for button in row
+    ]
+    assert f"m:reply:{first_case['id']}:0" in buttons
+
+    await manager_navigation(
+        FakeCallback(settings.admin_telegram_id, f"m:reply:{first_case['id']}:0"),
+        database,
+        settings,
+    )
+    await reply_to_request(
+        FakeMessage(settings.admin_telegram_id, 78, text="پاسخ برای نفر اول"),
+        bot,
+        database,
+        settings,
+    )
+
+    assert [copy["chat_id"] for copy in bot.copies] == [1801]
+    assert (await database.list_messages(first_case["id"]))[-1]["text"] == "پاسخ برای نفر اول"
+    assert len(await database.list_messages(second_case["id"])) == 1
+    assert bot.sent[-1][1]["message_id"] == open_callback.message.message_id

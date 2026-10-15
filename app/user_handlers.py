@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import html
 import logging
 
 from aiogram import Bot, F, Router
@@ -13,6 +14,7 @@ from app.database import Database
 from app.domain import toggle_selection
 from app.keyboards import (
     form_options,
+    open_conversation,
     user_home,
 )
 from app.media import message_media
@@ -25,14 +27,25 @@ def _is_owner(user_id: int, settings: Settings) -> bool:
 
 def _question_text(step: str, data: dict, settings: Settings) -> str:
     if step == "have":
-        return "چه اطلاعاتی داری؟"
+        return (
+            "<b>① از ۲ · چه اطلاعاتی داری؟</b>\n\n"
+            "هر موردی را که از شخص می‌دانی انتخاب کن. بعد از ادامه، مقدار هر مورد را جداگانه می‌گیریم.\n\n"
+            "اگر موردی نداری، بدون انتخاب ادامه بده."
+        )
     if step == "need":
-        return "دنبال چه اطلاعاتی هستی؟"
+        return (
+            "<b>② از ۲ · دنبال چه اطلاعاتی هستی؟</b>\n\n"
+            "مواردی را که دنبالش هستی انتخاب کن؛ این بخش هم می‌تواند خالی بماند.\n\n"
+            "برای توضیح بیشتر، «توضیحات تکمیلی» را انتخاب کن."
+        )
     if step == "have_value":
         fields = data.get("have_fields", data.get("have", []))
         index = data.get("field_index", 0)
         field = fields[index] if index < len(fields) else "اطلاعات"
-        return f"مقدار «{field}» را بنویس."
+        return (
+            f"<b>مقدار {html.escape(field)}</b>\n\n"
+            f"مورد {index + 1} از {len(fields)} را بنویس."
+        )
     return ""
 
 
@@ -70,13 +83,15 @@ async def _show_draft(message: Message | CallbackQuery, database: Database, sett
                 await database.register_user(message.from_user.id), draft["step"], draft["data"]
             )
         try:
-            await message.message.edit_text(text, reply_markup=keyboard)
+            await message.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
         except TelegramBadRequest:
             sent_message = await message.message.answer(
-                text, reply_markup=keyboard, protect_content=True
+                text, reply_markup=keyboard, parse_mode="HTML", protect_content=True
             )
     else:
-        sent_message = await message.answer(text, reply_markup=keyboard, protect_content=True)
+        sent_message = await message.answer(
+            text, reply_markup=keyboard, parse_mode="HTML", protect_content=True
+        )
     if saved_draft and sent_message:
         message_ids = draft["data"].setdefault("chat_message_ids", [])
         sent_id = getattr(sent_message, "message_id", None)
@@ -119,8 +134,17 @@ def _format_new_case(case: dict) -> str:
     )
 
 
+def _format_new_message(case: dict, text: str | None, media_type: str) -> str:
+    name = " ".join(
+        value for value in (case.get("first_name"), case.get("last_name")) if value
+    ) or "کاربر"
+    username = f"@{case['username']}" if case.get("username") else "نام کاربری ندارد"
+    preview = " ".join(text.split())[:180] if text else f"[{media_type}]"
+    return f"💬 پیام جدید از {name} · {username}\nشناسه: {case['telegram_id']}\n\n{preview}"
+
+
 async def _show_home(message: Message | CallbackQuery, settings: Settings) -> None:
-    welcome = "سلام! برای ثبت درخواست، دکمهٔ زیر را بزن."
+    welcome = "سلام! 👋\n\nبرای ثبت درخواست از دکمهٔ زیر شروع کن."
     if isinstance(message, CallbackQuery):
         await message.answer()
         try:
@@ -302,15 +326,13 @@ async def user_messages(message: Message, bot: Bot, database: Database, settings
     )
     if not inserted:
         return
+    await database.update_message_delivery(message.chat.id, message.message_id, "SENT")
     try:
-        copied = await bot.forward_message(
-            chat_id=settings.admin_telegram_id,
-            from_chat_id=message.chat.id,
-            message_id=message.message_id,
+        await bot.send_message(
+            settings.admin_telegram_id,
+            _format_new_message(case, text, media_type),
+            reply_markup=open_conversation(case["id"]),
             protect_content=True,
         )
-    except Exception:
-        await database.update_message_delivery(message.chat.id, message.message_id, "FAILED")
-        logger.warning("user message delivery failed for case %s", case["id"])
-        return
-    await database.update_message_delivery(message.chat.id, message.message_id, "SENT", copied.message_id)
+    except TelegramAPIError:
+        logger.warning("new user message notice delivery failed for case %s", case["id"])

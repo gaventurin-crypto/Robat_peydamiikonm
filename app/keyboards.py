@@ -26,6 +26,12 @@ def finish_conversation(case_id: int) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+def open_conversation(case_id: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="باز کردن گفتگو", callback_data=f"m:open:{case_id}:0")
+    return builder.as_markup()
+
+
 def notice_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="می‌فهمم، ادامه", callback_data="u:notice:accept")
@@ -38,9 +44,10 @@ def form_options(
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for index, option in enumerate(options):
-        mark = "☑️" if option in selected else "▫️"
+        mark = "✅" if option in selected else "▫️"
         builder.button(text=f"{mark} {option}", callback_data=f"u:toggle:{step}:{index}")
-    builder.row(InlineKeyboardButton(text="ادامه", callback_data=f"u:next:{step}"))
+    next_text = "ادامه ⟶" if step == "have" else "ثبت درخواست ✓"
+    builder.row(InlineKeyboardButton(text=next_text, callback_data=f"u:next:{step}"))
     builder.adjust(*([1] * len(options)), 1)
     return builder.as_markup()
 

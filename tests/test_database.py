@@ -133,6 +133,27 @@ async def test_conversation_lifecycle_is_case_scoped_and_persistent(database):
 
 
 @pytest.mark.asyncio
+async def test_admin_inbox_lists_cases_separately_with_identity_and_latest_message(database):
+    first_case = await database.create_case(208, sample_data())
+    second_case = await database.create_case(209, sample_data())
+    await database.add_message(first_case["id"], "user", "text", "پیام اول", None, 208, 1)
+    await database.add_message(second_case["id"], "user", "text", "پیام دوم", None, 209, 2)
+
+    chats = await database.list_admin_chats()
+
+    assert {chat["id"] for chat in chats} == {first_case["id"], second_case["id"]}
+    assert {chat["telegram_id"] for chat in chats} == {208, 209}
+    assert {chat["last_message"] for chat in chats} == {"پیام اول", "پیام دوم"}
+    assert await database.count_admin_chats() == 2
+    await database.start_conversation(first_case["id"], 900)
+    await database.activate_conversation(first_case["id"], 900)
+    await database.end_conversation(first_case["id"], 900)
+    chats = await database.list_admin_chats()
+    assert {chat["id"] for chat in chats} == {second_case["id"]}
+    assert await database.count_admin_chats() == 1
+
+
+@pytest.mark.asyncio
 async def test_initialize_does_not_mark_new_case_open_from_another_case_session(database):
     active_case = await database.create_case(207, sample_data())
     pending_case = await database.create_case(207, sample_data())
